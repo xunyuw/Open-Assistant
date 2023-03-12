@@ -7,13 +7,14 @@ from typing import Optional
 from uuid import UUID, uuid4
 
 import oasst_backend.models.db_payload as db_payload
-import sqlalchemy as sa
+import sqlalchemy.dialects.postgresql as pg
 from loguru import logger
 from oasst_backend.api.deps import FrontendUserId
 from oasst_backend.config import settings
 from oasst_backend.journal_writer import JournalWriter
 from oasst_backend.models import (
     ApiClient,
+    FlaggedMessage,
     Message,
     MessageEmbedding,
     MessageEmoji,
@@ -36,7 +37,21 @@ from oasst_shared.utils import unaware_to_utc, utcnow
 from sqlalchemy.orm import Query
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import JSON, Session, and_, func, literal_column, not_, or_, text, update
-from starlette.status import HTTP_403_FORBIDDEN, HTTP_404_NOT_FOUND
+
+_task_type_and_reaction = (
+    (
+        (db_payload.PrompterReplyPayload, db_payload.AssistantReplyPayload),
+        protocol_schema.EmojiCode.skip_reply,
+    ),
+    (
+        (db_payload.LabelInitialPromptPayload, db_payload.LabelConversationReplyPayload),
+        protocol_schema.EmojiCode.skip_labeling,
+    ),
+    (
+        (db_payload.RankInitialPromptsPayload, db_payload.RankConversationRepliesPayload),
+        protocol_schema.EmojiCode.skip_ranking,
+    ),
+)
 
 
 class PromptRepository:
@@ -62,13 +77,11 @@ class PromptRepository:
 
         if user_id:
             self.user = self.user_repository.get_user(id=user_id)
-            self.user_id = self.user.id
         elif auth_method and username:
             self.user = self.user_repository.query_frontend_user(auth_method=auth_method, username=username)
-            self.user_id = self.user.id
         else:
             self.user = self.user_repository.lookup_client_user(client_user, create_missing=True)
-            self.user_id = self.user.id if self.user else None
+        self.user_id = self.user.id if self.user else None
         logger.debug(f"PromptRepository(api_client_id={self.api_client.id}, {self.user_id=})")
         self.task_repository = task_repository or TaskRepository(
             db, api_client, client_user, user_repository=self.user_repository
@@ -80,7 +93,14 @@ class PromptRepository:
             raise OasstError("User required", OasstErrorCode.USER_NOT_SPECIFIED)
 
         if self.user.deleted or not self.user.enabled:
-            raise OasstError("User account disabled", OasstErrorCode.USER_DISABLED)
+            raise OasstError("User account disabled", OasstErrorCode.USER_DISABLED, HTTPStatus.SERVICE_UNAVAILABLE)
+
+        if self.user.tos_acceptance_date is None and not settings.DEBUG_IGNORE_TOS_ACCEPTANCE:
+            raise OasstError(
+                "User has not accepted terms of service.",
+                OasstErrorCode.USER_HAS_NOT_ACCEPTED_TOS,
+                HTTPStatus.UNAVAILABLE_FOR_LEGAL_REASONS,
+            )
 
     def fetch_message_by_frontend_message_id(self, frontend_message_id: str, fail_if_missing: bool = True) -> Message:
         validate_frontend_message_id(frontend_message_id)
@@ -93,7 +113,7 @@ class PromptRepository:
             raise OasstError(
                 f"Message with frontend_message_id {frontend_message_id} not found.",
                 OasstErrorCode.MESSAGE_NOT_FOUND,
-                HTTP_404_NOT_FOUND,
+                HTTPStatus.NOT_FOUND,
             )
         return message
 
@@ -112,7 +132,8 @@ class PromptRepository:
         payload_type: str = None,
         depth: int = 0,
         review_count: int = 0,
-        review_result: bool = False,
+        review_result: bool = None,
+        deleted: bool = False,
     ) -> Message:
         if payload_type is None:
             if payload is None:
@@ -135,14 +156,18 @@ class PromptRepository:
             depth=depth,
             review_count=review_count,
             review_result=review_result,
+            deleted=deleted,
         )
         self.db.add(message)
-
-        # self.db.refresh(message)
         return message
 
     def _validate_task(
-        self, task: Task, *, task_id: Optional[UUID] = None, frontend_message_id: Optional[str] = None
+        self,
+        task: Task,
+        *,
+        task_id: Optional[UUID] = None,
+        frontend_message_id: Optional[str] = None,
+        check_ack: bool = True,
     ) -> Task:
         if task is None:
             if task_id:
@@ -153,7 +178,7 @@ class PromptRepository:
 
         if task.expired:
             raise OasstError("Task already expired.", OasstErrorCode.TASK_EXPIRED)
-        if not task.ack:
+        if check_ack and not task.ack:
             raise OasstError("Task is not acknowledged.", OasstErrorCode.TASK_NOT_ACK)
         if task.done:
             raise OasstError("Task already done.", OasstErrorCode.TASK_ALREADY_DONE)
@@ -175,7 +200,7 @@ class PromptRepository:
         frontend_message_id: str,
         user_frontend_message_id: str,
         review_count: int = 0,
-        review_result: bool = False,
+        review_result: bool = None,
         check_tree_state: bool = True,
         check_duplicate: bool = True,
     ) -> Message:
@@ -188,8 +213,9 @@ class PromptRepository:
         self._validate_task(task)
 
         # If there's no parent message assume user started new conversation
-        role = None
-        depth = 0
+        role: str = None
+        depth: int = 0
+        deleted: bool = False
 
         # reject whitespaces match with ^\s+$
         if re.match(r"^\s+$", text):
@@ -208,11 +234,33 @@ class PromptRepository:
 
             # check tree state
             if check_tree_state:
+                # We store messages even after a tree has been completed.
+                # Although these messages will never be labeled nor ranked they should be
+                # included in the dataset because sometime users put a lot of effort into
+                # writing their reply.
+
                 ts = self.fetch_tree_state(parent_message.message_tree_id)
-                if not ts.active or ts.state != message_tree_state.State.GROWING:
+                if ts.state not in (
+                    message_tree_state.State.GROWING,
+                    message_tree_state.State.RANKING,
+                    message_tree_state.State.READY_FOR_SCORING,
+                    message_tree_state.State.READY_FOR_EXPORT,
+                ):
                     raise OasstError(
-                        "Message insertion failed. Message tree is no longer in 'growing' state.",
-                        OasstErrorCode.TREE_NOT_IN_GROWING_STATE,
+                        "Message insertion failed. Message tree is no longer accepting messages.",
+                        OasstErrorCode.TREE_IN_ABORTED_STATE,
+                    )
+                if not ts.active:
+                    logger.warning(
+                        f"Received messsage for inactive tree {parent_message.message_tree_id} (state='{ts.state.value}')."
+                    )
+
+            if check_duplicate and not settings.DEBUG_ALLOW_DUPLICATE_TASKS:
+                siblings = self.fetch_message_children(task.parent_message_id, review_result=None, deleted=False)
+                if any(m.user_id == self.user_id for m in siblings):
+                    raise OasstError(
+                        "User cannot reply twice to the same message.",
+                        OasstErrorCode.TASK_MESSAGE_DUPLICATE_REPLY,
                     )
 
             parent_message.message_tree_id
@@ -220,6 +268,7 @@ class PromptRepository:
             self.db.add(parent_message)
 
             depth = parent_message.depth + 1
+            deleted = parent_message.deleted
 
         task_payload: db_payload.TaskPayload = task.payload.payload
         if isinstance(task_payload, db_payload.InitialPromptPayload):
@@ -252,11 +301,16 @@ class PromptRepository:
             depth=depth,
             review_count=review_count,
             review_result=review_result,
+            deleted=deleted,
         )
         if not task.collective:
             task.done = True
             self.db.add(task)
         self.journal.log_text_reply(task=task, message_id=new_message_id, role=role, length=len(text))
+        logger.debug(
+            f"Inserted message id={user_message.id}, tree={user_message.message_tree_id}, user_id={user_message.user_id}, "
+            f"text[:100]='{user_message.text[:100]}', role='{user_message.role}', lang='{user_message.lang}'"
+        )
         return user_message
 
     @managed_tx_method(CommitMode.FLUSH)
@@ -303,7 +357,6 @@ class PromptRepository:
         )
 
         match type(task_payload):
-
             case db_payload.RankPrompterRepliesPayload | db_payload.RankAssistantRepliesPayload:
                 # validate ranking
                 if sorted(ranking.ranking) != list(range(num_replies := len(task_payload.reply_messages))):
@@ -329,6 +382,7 @@ class PromptRepository:
                     ranked_message_ids=ranked_message_ids,
                     ranking_parent_id=task_payload.ranking_parent_id,
                     message_tree_id=task_payload.message_tree_id,
+                    not_rankable=ranking.not_rankable,
                 )
                 reaction = self.insert_reaction(task_id=task.id, payload=reaction_payload, message_id=parent_msg.id)
                 self.journal.log_ranking(task, message_id=parent_msg.id, ranking=ranking.ranking)
@@ -419,6 +473,7 @@ class PromptRepository:
 
     @managed_tx_method(CommitMode.FLUSH)
     def store_text_labels(self, text_labels: protocol_schema.TextLabels) -> tuple[TextLabels, Task, Message]:
+        self.ensure_user_is_enabled()
 
         valid_labels: Optional[list[str]] = None
         mandatory_labels: Optional[list[str]] = None
@@ -450,7 +505,7 @@ class PromptRepository:
                     OasstErrorCode.TASK_PAYLOAD_TYPE_MISMATCH,
                 )
 
-            logger.debug(f"text_labels relpy: {valid_labels=}, {mandatory_labels=}")
+            logger.debug(f"text_labels reply: {valid_labels=}, {mandatory_labels=}")
 
             if valid_labels:
                 if not all([label in valid_labels for label in text_labels.labels.keys()]):
@@ -484,6 +539,8 @@ class PromptRepository:
         message: Message = None
         if message_id:
             if not task:
+                # free labeling case
+
                 if text_labels.is_report is True:
                     message = self.handle_message_emoji(
                         message_id, protocol_schema.EmojiOp.add, protocol_schema.EmojiCode.red_flag
@@ -496,14 +553,33 @@ class PromptRepository:
                     model = existing_text_label
 
             else:
-                message = self.fetch_message(message_id)
+                # task based labeling case
+
+                message = self.fetch_message(message_id, fail_if_missing=True)
+                if not settings.DEBUG_ALLOW_SELF_LABELING and message.user_id == self.user_id:
+                    raise OasstError(
+                        "Labeling own message is not allowed.", OasstErrorCode.TEXT_LABELS_NO_SELF_LABELING
+                    )
+
+                existing_labels = self.fetch_message_text_labels(message_id, self.user_id)
+                if not settings.DEBUG_ALLOW_DUPLICATE_TASKS and any(l.task_id for l in existing_labels):
+                    raise OasstError(
+                        "Message was already labeled by same user before.",
+                        OasstErrorCode.TEXT_LABELS_DUPLICATE_TASK_REPLY,
+                    )
+
                 message.review_count += 1
                 self.db.add(message)
 
         self.db.add(model)
         return model, task, message
 
-    def fetch_random_message_tree(self, require_role: str = None, reviewed: bool = True) -> list[Message]:
+    def fetch_random_message_tree(
+        self,
+        require_role: str = None,
+        review_result: Optional[bool] = True,
+        deleted: Optional[bool] = False,
+    ) -> list[Message]:
         """
         Loads all messages of a random message_tree.
 
@@ -513,17 +589,21 @@ class PromptRepository:
         distinct_message_trees = self.db.query(Message.message_tree_id).distinct(Message.message_tree_id)
         if require_role:
             distinct_message_trees = distinct_message_trees.filter(Message.role == require_role)
-        if reviewed:
-            distinct_message_trees = distinct_message_trees.filter(Message.review_result)
+        if review_result is not None:
+            distinct_message_trees = distinct_message_trees.filter(Message.review_result == review_result)
         distinct_message_trees = distinct_message_trees.subquery()
 
         random_message_tree_id = self.db.query(distinct_message_trees).order_by(func.random()).limit(1).scalar()
         if random_message_tree_id:
-            return self.fetch_message_tree(random_message_tree_id, reviewed)
+            return self.fetch_message_tree(random_message_tree_id, review_result=review_result, deleted=deleted)
         return None
 
     def fetch_random_conversation(
-        self, last_message_role: str = None, message_tree_id: Optional[UUID] = None, reviewed: bool = True
+        self,
+        last_message_role: str = None,
+        message_tree_id: Optional[UUID] = None,
+        review_result: Optional[bool] = True,
+        deleted: Optional[bool] = False,
     ) -> list[Message]:
         """
         Picks a random linear conversation starting from any root message
@@ -535,9 +615,11 @@ class PromptRepository:
             needs to have "assistant" role.
         """
         if message_tree_id:
-            messages_tree = self.fetch_message_tree(message_tree_id, reviewed)
+            messages_tree = self.fetch_message_tree(message_tree_id, review_result=review_result, deleted=deleted)
         else:
-            messages_tree = self.fetch_random_message_tree(last_message_role)
+            messages_tree = self.fetch_random_message_tree(
+                last_message_role, review_result=review_result, deleted=deleted
+            )
         if not messages_tree:
             raise OasstError("No message tree found", OasstErrorCode.NO_MESSAGE_TREE_FOUND)
 
@@ -563,13 +645,16 @@ class PromptRepository:
         return messages
 
     def fetch_message_tree(
-        self, message_tree_id: UUID, reviewed: bool = True, include_deleted: bool = False
+        self,
+        message_tree_id: UUID,
+        review_result: Optional[bool] = True,
+        deleted: Optional[bool] = False,
     ) -> list[Message]:
         qry = self.db.query(Message).filter(Message.message_tree_id == message_tree_id)
-        if reviewed:
-            qry = qry.filter(Message.review_result)
-        if not include_deleted:
-            qry = qry.filter(not_(Message.deleted))
+        if review_result is not None:
+            qry = qry.filter(Message.review_result == review_result)
+        if deleted is not None:
+            qry = qry.filter(Message.deleted == deleted)
         return self._add_user_emojis_all(qry)
 
     def check_users_recent_replies_for_duplicates(self, text: str) -> bool:
@@ -605,12 +690,6 @@ class PromptRepository:
         if not include_deleted:
             qry = qry.filter(not_(Message.deleted))
         return self._add_user_emojis_all(qry)
-
-    def fetch_message_trees_ready_for_export(self) -> list[MessageTreeState]:
-        qry = self.db.query(MessageTreeState).filter(
-            MessageTreeState.state == message_tree_state.State.READY_FOR_EXPORT
-        )
-        return qry.all()
 
     def fetch_multiple_random_replies(self, max_size: int = 5, message_role: str = None):
         """
@@ -653,11 +732,10 @@ class PromptRepository:
 
         message = self.db.query(Message).filter(Message.id == message_id).one_or_none()
         if fail_if_missing and not message:
-            raise OasstError("Message not found", OasstErrorCode.MESSAGE_NOT_FOUND, HTTP_404_NOT_FOUND)
+            raise OasstError("Message not found", OasstErrorCode.MESSAGE_NOT_FOUND, HTTPStatus.NOT_FOUND)
         return message
 
     def fetch_non_task_text_labels(self, message_id: UUID, user_id: UUID) -> Optional[TextLabels]:
-
         query = (
             self.db.query(TextLabels)
             .outerjoin(Task, Task.id == TextLabels.id)
@@ -665,6 +743,12 @@ class PromptRepository:
         )
         text_label = query.one_or_none()
         return text_label
+
+    def fetch_message_text_labels(self, message_id: UUID, user_id: Optional[UUID] = None) -> list[TextLabels]:
+        query = self.db.query(TextLabels).filter(TextLabels.message_id == message_id)
+        if user_id is not None:
+            query = query.filter(TextLabels.user_id == user_id)
+        return query.all()
 
     @staticmethod
     def trace_conversation(messages: list[Message] | dict[UUID, Message], last_message: Message) -> list[Message]:
@@ -683,6 +767,9 @@ class PromptRepository:
         while conv[-1].parent_id:
             if conv[-1].parent_id not in messages:
                 # Can't form a continuous conversation
+                logger.error(
+                    f"Broken conversation: parent of message (id={conv[-1].id}, parent_id={conv[-1].parent_id}) not found in result set"
+                )
                 raise OasstError(
                     "Broken conversation", OasstErrorCode.BROKEN_CONVERSATION, HTTPStatus.INTERNAL_SERVER_ERROR
                 )
@@ -702,17 +789,25 @@ class PromptRepository:
         tree_messages = self.fetch_message_tree(message.message_tree_id)
         return self.trace_conversation(tree_messages, message)
 
-    def fetch_tree_from_message(self, message: Message | UUID) -> list[Message]:
+    def fetch_tree_from_message(
+        self,
+        message: Message | UUID,
+        review_result: Optional[bool] = True,
+        deleted: Optional[bool] = False,
+    ) -> list[Message]:
         """
         Fetch message tree this message belongs to.
         """
         if isinstance(message, UUID):
             message = self.fetch_message(message)
         logger.debug(f"fetch_message_tree({message.message_tree_id=})")
-        return self.fetch_message_tree(message.message_tree_id)
+        return self.fetch_message_tree(message.message_tree_id, review_result=review_result, deleted=deleted)
 
     def fetch_message_children(
-        self, message: Message | UUID, reviewed: bool = True, exclude_deleted: bool = True
+        self,
+        message: Message | UUID,
+        review_result: Optional[bool] = True,
+        deleted: Optional[bool] = False,
     ) -> list[Message]:
         """
         Get all direct children of this message
@@ -721,26 +816,31 @@ class PromptRepository:
             message = message.id
 
         qry = self.db.query(Message).filter(Message.parent_id == message)
-        if reviewed:
-            qry = qry.filter(Message.review_result)
-        if exclude_deleted:
-            qry = qry.filter(Message.deleted == sa.false())
+        if review_result is not None:
+            qry = qry.filter(Message.review_result == review_result)
+        if deleted is not None:
+            qry = qry.filter(Message.deleted == deleted)
         children = self._add_user_emojis_all(qry)
         return children
 
     def fetch_message_siblings(
-        self, message: Message | UUID, reviewed: Optional[bool] = True, deleted: Optional[bool] = False
+        self,
+        message: Message | UUID,
+        review_result: Optional[bool] = True,
+        deleted: Optional[bool] = False,
     ) -> list[Message]:
         """
         Get siblings of a message (other messages with the same parent_id)
         """
+        qry = self.db.query(Message)
         if isinstance(message, Message):
-            message = message.id
+            qry = qry.filter(Message.parent_id == message.parent_id)
+        else:
+            parent_qry = self.db.query(Message.parent_id).filter(Message.id == message).subquery()
+            qry = qry.filter(Message.parent_id == parent_qry.c.parent_id)
 
-        parent_qry = self.db.query(Message.parent_id).filter(Message.id == message).subquery()
-        qry = self.db.query(Message).filter(Message.parent_id == parent_qry.c.parent_id)
-        if reviewed is not None:
-            qry = qry.filter(Message.review_result == reviewed)
+        if review_result is not None:
+            qry = qry.filter(Message.review_result == review_result)
         if deleted is not None:
             qry = qry.filter(Message.deleted == deleted)
         siblings = self._add_user_emojis_all(qry)
@@ -788,13 +888,27 @@ class PromptRepository:
         max_message = max(tree, key=lambda m: m.children_count)
         return max_message, [m for m in tree if m.parent_id == max_message.id]
 
-    def _add_user_emojis_all(self, qry: Query) -> list[Message]:
+    def _add_user_emojis_all(self, qry: Query, include_user: bool = False) -> list[Message]:
         if self.user_id is None:
-            return qry.all()
+            if not include_user:
+                return qry.all()
 
+            messages: list[Message] = []
+
+            for element in qry:
+                message = element["Message"]
+                user = element["User"]
+                message._user = user
+                messages.append(message)
+            return messages
+
+        order_by_clauses = qry._order_by_clauses
         sq = qry.subquery("m")
+        select_entities = [Message, func.string_agg(MessageEmoji.emoji, literal_column("','")).label("user_emojis")]
+        if include_user:
+            select_entities.append(User)
         qry = (
-            self.db.query(Message, func.string_agg(MessageEmoji.emoji, literal_column("','")).label("user_emojis"))
+            self.db.query(*select_entities)
             .select_entity_from(sq)
             .outerjoin(
                 MessageEmoji,
@@ -806,13 +920,18 @@ class PromptRepository:
             )
             .group_by(sq)
         )
+        qry._order_by_clauses = order_by_clauses
         messages: list[Message] = []
         for x in qry:
             m: Message = x.Message
             user_emojis = x["user_emojis"]
             if user_emojis:
                 m._user_emojis = user_emojis.split(",")
+            m._user_is_author = self.user_id and self.user_id == m.user_id
+            if include_user:
+                m._user = x["User"]
             messages.append(m)
+
         return messages
 
     def query_messages_ordered_by_created_date(
@@ -827,9 +946,11 @@ class PromptRepository:
         lt_id: Optional[UUID] = None,
         only_roots: bool = False,
         deleted: Optional[bool] = None,
+        review_result: Optional[bool] = None,
         desc: bool = False,
         limit: Optional[int] = 100,
         lang: Optional[str] = None,
+        include_user: Optional[bool] = None,
     ) -> list[Message]:
         if not self.api_client.trusted:
             if not api_client_id:
@@ -838,15 +959,18 @@ class PromptRepository:
 
             if api_client_id != self.api_client.id:
                 # Unprivileged api client asks for foreign messages
-                raise OasstError("Forbidden", OasstErrorCode.API_CLIENT_NOT_AUTHORIZED, HTTP_403_FORBIDDEN)
+                raise OasstError("Forbidden", OasstErrorCode.API_CLIENT_NOT_AUTHORIZED, HTTPStatus.FORBIDDEN)
 
         qry = self.db.query(Message)
+        if include_user:
+            qry = self.db.query(Message, User)
         if user_id:
             qry = qry.filter(Message.user_id == user_id)
+        if username or auth_method or include_user:
+            qry = qry.join(User)
         if username or auth_method:
             if not (username and auth_method):
                 raise OasstError("Auth method or username missing.", OasstErrorCode.AUTH_AND_USERNAME_REQUIRED)
-            qry = qry.join(User)
             qry = qry.filter(User.username == username, User.auth_method == auth_method)
         if api_client_id:
             qry = qry.filter(Message.api_client_id == api_client_id)
@@ -886,6 +1010,12 @@ class PromptRepository:
         if deleted is not None:
             qry = qry.filter(Message.deleted == deleted)
 
+        if review_result is not None:
+            qry = qry.filter(Message.review_result == review_result)
+
+        if lang is not None:
+            qry = qry.filter(Message.lang == lang)
+
         if desc:
             qry = qry.order_by(Message.created_date.desc(), Message.id.desc())
         else:
@@ -894,10 +1024,7 @@ class PromptRepository:
         if limit is not None:
             qry = qry.limit(limit)
 
-        if lang is not None:
-            qry = qry.filter(Message.lang == lang)
-
-        return self._add_user_emojis_all(qry)
+        return self._add_user_emojis_all(qry, include_user=include_user)
 
     def update_children_counts(self, message_tree_id: UUID):
         sql_update_children_count = """
@@ -947,19 +1074,63 @@ WHERE message.id = cc.id;
         Get data stats such as number of all messages in the system,
         number of deleted and active messages and number of message trees.
         """
-        deleted = self.db.query(Message.deleted, func.count()).group_by(Message.deleted)
-        nthreads = self.db.query(None, func.count(Message.id)).filter(Message.parent_id.is_(None))
-        query = deleted.union_all(nthreads)
-        result = {k: v for k, v in query.all()}
+        # With columns: lang, deleted, count
+        group_count_query = self.db.query(Message.lang, Message.deleted, func.count()).group_by(
+            Message.lang, Message.deleted
+        )
+        # With columns: None, None, count
+        msg_tree_query = self.db.query(None, None, func.count(Message.id)).filter(Message.parent_id.is_(None))
+        # Union both queries, so that we can fetch the counts in one database query
+        query = group_count_query.union_all(msg_tree_query)
+
+        nactives = 0
+        ndeleted = 0
+        nactives_by_lang = {}
+        nthreads = 0
+
+        for lang, deleted, count in query.all():
+            if lang is None:  # corresponds to msg_tree_query
+                nthreads = count
+                continue
+            if deleted is False:  # corresponds to group_count_query (lang, deleted=False)
+                nactives_by_lang[lang] = count
+                nactives += count
+            else:  # corresponds to group_count_query (lang, deleted=True)
+                ndeleted += count
 
         return SystemStats(
-            all=result.get(True, 0) + result.get(False, 0),
-            active=result.get(False, 0),
-            deleted=result.get(True, 0),
-            message_trees=result.get(None, 0),
+            all=nactives + ndeleted,
+            active=nactives,
+            active_by_lang=nactives_by_lang,
+            deleted=ndeleted,
+            message_trees=nthreads,
         )
 
-    def handle_message_emoji(self, message_id: UUID, op: protocol_schema.EmojiOp, emoji: protocol_schema) -> Message:
+    @managed_tx_method()
+    def skip_task(self, task_id: UUID, reason: Optional[str]):
+        self.ensure_user_is_enabled()
+
+        task = self.task_repository.fetch_task_by_id(task_id)
+        self._validate_task(task, check_ack=False)
+
+        if not task.collective:
+            task.skipped = True
+            task.skip_reason = reason
+            self.db.add(task)
+
+        def handle_cancel_emoji(task_payload: db_payload.TaskPayload) -> Message | None:
+            for types, emoji in _task_type_and_reaction:
+                for t in types:
+                    if isinstance(task_payload, t):
+                        return self.handle_message_emoji(task.parent_message_id, protocol_schema.EmojiOp.add, emoji)
+            return None
+
+        task_payload: db_payload.TaskPayload = task.payload.payload
+        handle_cancel_emoji(task_payload)
+
+    def handle_message_emoji(
+        self, message_id: UUID, op: protocol_schema.EmojiOp, emoji: protocol_schema.EmojiCode
+    ) -> Message:
         self.ensure_user_is_enabled()
 
         message = self.fetch_message(message_id)
@@ -1002,6 +1173,22 @@ WHERE message.id = cc.id;
                     message_id, protocol_schema.EmojiOp.remove, protocol_schema.EmojiCode.thumbs_up
                 )
 
+            if message.user_id == self.user_id and emoji in (
+                protocol_schema.EmojiCode.thumbs_up,
+                protocol_schema.EmojiCode.thumbs_down,
+            ):
+                logger.debug(f"Ignoring add emoji op for user's own message ({emoji=})")
+                return message
+
+            # Add to flagged_message table if the red flag emoji is applied
+            if emoji == protocol_schema.EmojiCode.red_flag:
+                flagged_message = FlaggedMessage(message_id=message_id, processed=False, created_date=utcnow())
+                insert_stmt = pg.insert(FlaggedMessage).values(**flagged_message.dict())
+                upsert_stmt = insert_stmt.on_conflict_do_update(
+                    constraint="flagged_message_pkey", set_=flagged_message.dict()
+                )
+                self.db.execute(upsert_stmt)
+
             # insert emoji record & increment count
             message_emoji = MessageEmoji(message_id=message.id, user_id=self.user_id, emoji=emoji)
             self.db.add(message_emoji)
@@ -1036,4 +1223,23 @@ WHERE message.id = cc.id;
         flag_modified(message, "emojis")
         self.db.add(message)
         self.db.flush()
+        return message
+
+    def fetch_flagged_messages(self, max_count: Optional[int]) -> list[FlaggedMessage]:
+        qry = self.db.query(FlaggedMessage)
+        if max_count is not None:
+            qry = qry.limit(max_count)
+
+        return qry.all()
+
+    def process_flagged_message(self, message_id: UUID) -> FlaggedMessage:
+        message = self.db.query(FlaggedMessage).get(message_id)
+
+        if not message:
+            raise OasstError("Message not found", OasstErrorCode.MESSAGE_NOT_FOUND, HTTPStatus.NOT_FOUND)
+
+        message.processed = True
+        self.db.commit()
+        self.db.refresh(message)
+
         return message

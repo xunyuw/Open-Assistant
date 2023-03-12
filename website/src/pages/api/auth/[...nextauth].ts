@@ -1,13 +1,18 @@
 import { PrismaAdapter } from "@next-auth/prisma-adapter";
 import { boolean } from "boolean";
+import { generateUsername } from "friendly-username-generator";
+import { NextApiRequest, NextApiResponse } from "next";
 import type { AuthOptions } from "next-auth";
 import NextAuth from "next-auth";
 import { Provider } from "next-auth/providers";
 import CredentialsProvider from "next-auth/providers/credentials";
 import DiscordProvider from "next-auth/providers/discord";
 import EmailProvider from "next-auth/providers/email";
+import { checkCaptcha } from "src/lib/captcha";
+import { discordAvatarRefresh } from "src/lib/discord_avatar_refresh";
+import { createApiClientFromUser } from "src/lib/oasst_client_factory";
 import prisma from "src/lib/prismadb";
-import { generateUsername } from "unique-username-generator";
+import { BackendUserCore } from "src/types/Users";
 
 const providers: Provider[] = [];
 
@@ -74,10 +79,21 @@ const adminUserMap = process.env.ADMIN_USERS.split(",").reduce((result, entry) =
   return result;
 }, new Map());
 
-export const authOptions: AuthOptions = {
+const moderatorUserMap = process.env.MODERATOR_USERS.split(",").reduce((result, entry) => {
+  const [authType, id] = entry.split(":");
+  const s = result.get(authType) || new Set();
+  s.add(id);
+  result.set(authType, s);
+  return result;
+}, new Map());
+
+const authOptions: AuthOptions = {
   // Ensure we can store user data in a database.
   adapter: PrismaAdapter(prisma),
   providers,
+  session: {
+    strategy: "jwt",
+  },
   pages: {
     signIn: "/auth/signin",
     verifyRequest: "/auth/verify",
@@ -92,6 +108,7 @@ export const authOptions: AuthOptions = {
       session.user.role = token.role;
       session.user.isNew = token.isNew;
       session.user.name = token.name;
+      session.user.tosAcceptanceDate = token.tosAcceptanceDate;
       return session;
     },
     /**
@@ -99,13 +116,44 @@ export const authOptions: AuthOptions = {
      * This let's use forward the role to the session object.
      */
     async jwt({ token }) {
-      const { isNew, name, role } = await prisma.user.findUnique({
+      const { isNew, name, role, accounts, id } = await prisma.user.findUnique({
         where: { id: token.sub },
-        select: { name: true, role: true, isNew: true },
+        select: { name: true, role: true, isNew: true, accounts: true, id: true },
       });
+
+      // Note: This could be cleaner and merged with src/lib/users.ts
+      const user: BackendUserCore = {
+        id: accounts.length > 0 ? accounts[0].providerAccountId : id,
+        display_name: name,
+        auth_method: accounts.length > 0 ? accounts[0].provider : "local",
+      };
+      const oasstApiClient = createApiClientFromUser(user);
+
+      if (user.auth_method === "discord") {
+        const discordAccount = accounts.find((a) => a.provider === "discord");
+        discordAvatarRefresh.updateImageIfNecessary(discordAccount);
+      }
+
+      let tosAcceptanceDate = null;
+      try {
+        /**
+         * when first creating a new user, the python backend is not informed about it
+         * so this call will return a 404
+         *
+         * in the frontend, when the user accepts the tos, we do a full refresh
+         * which means this function will be called again.
+         */
+        tosAcceptanceDate = await oasstApiClient.fetch_tos_acceptance(user);
+      } catch (err) {
+        if (err.httpStatusCode !== 404) {
+          throw err;
+        }
+      }
+
       token.name = name;
       token.role = role;
       token.isNew = isNew;
+      token.tosAcceptanceDate = tosAcceptanceDate;
       return token;
     },
   },
@@ -127,9 +175,10 @@ export const authOptions: AuthOptions = {
 
       // Get the admin list for the user's auth type.
       const adminForAccountType = adminUserMap.get(account.provider);
+      const moderatorForAccountType = moderatorUserMap.get(account.provider);
 
       // Return early if there's no admin list.
-      if (!adminForAccountType) {
+      if (!adminForAccountType && !moderatorForAccountType) {
         return;
       }
 
@@ -146,26 +195,57 @@ export const authOptions: AuthOptions = {
           },
         });
       }
+
+      if (moderatorForAccountType.has(account.providerAccountId)) {
+        await prisma.user.update({
+          data: {
+            role: "moderator",
+          },
+          where: {
+            id: user.id,
+          },
+        });
+      }
     },
-  },
-  /*
-   * We maybe need this, we maybe don't.  Checking in this uncommented until
-   * it's confirmed we can drop this.
-  cookies: {
-    sessionToken: {
-      name: `next-auth.session-token`,
-      options: {
-        httpOnly: true,
-        sameSite: "none",
-        path: "/",
-        secure: true,
-      },
-    },
-  },
-  */
-  session: {
-    strategy: "jwt",
   },
 };
 
-export default NextAuth(authOptions);
+export default function auth(req: NextApiRequest, res: NextApiResponse) {
+  return NextAuth(req, res, {
+    ...authOptions,
+    callbacks: {
+      ...authOptions.callbacks,
+      async signIn({ account }) {
+        const isVerifyEmail = req.url ? req.url.includes("/api/auth/callback/email") : false;
+
+        if (account.provider !== "email" || !boolean(process.env.ENABLE_EMAIL_SIGNIN_CAPTCHA) || isVerifyEmail) {
+          return true;
+        }
+
+        if (account.provider === "email" && !boolean(process.env.ENABLE_EMAIL_SIGNIN)) {
+          return false;
+        }
+
+        const captcha = req.body.captcha;
+
+        const res = await checkCaptcha(captcha, getIp(req));
+
+        if (res.success) {
+          return true;
+        }
+
+        return "/auth/signin?error=InvalidCaptcha";
+      },
+    },
+  });
+}
+
+const getIp = (req: NextApiRequest) => {
+  try {
+    // https://stackoverflow.com/questions/66111742/get-the-client-ip-on-nextjs-and-use-ssr
+    const forwarded = req.headers["x-forwarded-for"];
+    return typeof forwarded === "string" ? forwarded.split(/, /)[0] : req.socket.remoteAddress;
+  } catch {
+    return "";
+  }
+};

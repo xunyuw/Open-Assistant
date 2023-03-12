@@ -1,3 +1,4 @@
+import { useToast } from "@chakra-ui/react";
 import { useTranslation } from "next-i18next";
 import { useCallback, useEffect, useReducer } from "react";
 import { useMemo, useRef } from "react";
@@ -5,13 +6,14 @@ import { TaskControls } from "src/components/Survey/TaskControls";
 import { CreateTask } from "src/components/Tasks/CreateTask";
 import { EvaluateTask } from "src/components/Tasks/EvaluateTask";
 import { LabelTask } from "src/components/Tasks/LabelTask";
-import { TaskCategory, TaskInfo, TaskInfos } from "src/components/Tasks/TaskTypes";
 import { UnchangedWarning } from "src/components/Tasks/UnchangedWarning";
-import { post } from "src/lib/api";
+import { useTaskContext } from "src/context/TaskContext";
+import { ERROR_CODES } from "src/lib/errors";
 import { getTypeSafei18nKey } from "src/lib/i18n";
+import { OasstError } from "src/lib/oasst_api_client";
+import { TaskCategory, TaskInfo } from "src/types/Task";
 import { BaseTask, TaskContent, TaskReplyValidity } from "src/types/Task";
-import { CreateTaskType, KnownTaskType, LabelTaskType, RankTaskType } from "src/types/Tasks";
-import useSWRMutation from "swr/mutation";
+import { CreateTaskType, LabelTaskType, RankTaskType } from "src/types/Tasks";
 
 interface EditMode {
   mode: "EDIT";
@@ -54,25 +56,20 @@ interface UpdateValidity {
   replyValidity: TaskReplyValidity;
 }
 
-export interface TaskSurveyProps<TaskType extends BaseTask, T> {
+export interface TaskSurveyProps<TaskType extends BaseTask, ReplyContent> {
   task: TaskType;
   taskType: TaskInfo;
   isEditable: boolean;
   isDisabled?: boolean;
-  onReplyChanged: (content: T) => void;
+  onReplyChanged: (content: ReplyContent) => void;
   onValidityChanged: (validity: TaskReplyValidity) => void;
 }
 
-interface TaskProps {
-  frontendId: string;
-  task: KnownTaskType;
-  isLoading: boolean;
-  completeTask: (TaskContent) => void;
-  skipTask: () => void;
-}
-
-export const Task = ({ frontendId, task, isLoading, completeTask, skipTask }: TaskProps) => {
-  const { t } = useTranslation("tasks");
+export const Task = () => {
+  const { t } = useTranslation(["tasks", "error"]);
+  const rootEl = useRef<HTMLDivElement>(null);
+  const replyContent = useRef<TaskContent>(null);
+  const { rejectTask, completeTask, isLoading, task, taskInfo, isRejecting, isSubmitting } = useTaskContext();
   const [taskStatus, taskEvent] = useReducer(
     (
       status: TaskStatus,
@@ -80,7 +77,7 @@ export const Task = ({ frontendId, task, isLoading, completeTask, skipTask }: Ta
     ): TaskStatus => {
       switch (event.action) {
         case "NEW_TASK":
-          return { mode: "EDIT", replyValidity: "INVALID" };
+          return status.mode !== "EDIT" ? { mode: "EDIT", replyValidity: "INVALID" } : status;
         case "UPDATE_VALIDITY":
           return status.mode === "EDIT" ? { mode: "EDIT", replyValidity: event.replyValidity } : status;
         case "ACCEPT_DEFAULT":
@@ -102,6 +99,9 @@ export const Task = ({ frontendId, task, isLoading, completeTask, skipTask }: Ta
               return { mode: "EDIT", replyValidity: "VALID" };
             case "DEFAULT_WARN":
               return { mode: "EDIT", replyValidity: "DEFAULT" };
+            case "SUBMITTED":
+              // allow return to edit from subbmitted mode (error happen during submitting task)
+              return { mode: "EDIT", replyValidity: "VALID" };
             default:
               return status;
           }
@@ -114,7 +114,6 @@ export const Task = ({ frontendId, task, isLoading, completeTask, skipTask }: Ta
     { mode: "EDIT", replyValidity: "INVALID" }
   );
 
-  const replyContent = useRef<TaskContent>(null);
   const updateValidity = useCallback(
     (replyValidity: TaskReplyValidity) => taskEvent({ action: "UPDATE_VALIDITY", replyValidity }),
     [taskEvent]
@@ -122,26 +121,8 @@ export const Task = ({ frontendId, task, isLoading, completeTask, skipTask }: Ta
 
   useEffect(() => {
     taskEvent({ action: "NEW_TASK" });
-  }, [task.id, updateValidity]);
-
-  const rootEl = useRef<HTMLDivElement>(null);
-
-  const taskType = useMemo(() => {
-    return TaskInfos.find((taskType) => taskType.type === task.type);
-  }, [task.type]);
-
-  const { trigger: sendRejection } = useSWRMutation("/api/reject_task", post, {
-    onSuccess: async () => {
-      skipTask();
-    },
-  });
-
-  const rejectTask = (reason: string) => {
-    sendRejection({
-      id: frontendId,
-      reason,
-    });
-  };
+    rootEl.current && scrollToTop(rootEl.current);
+  }, [task.id]);
 
   const onReplyChanged = useCallback(
     (content: TaskContent) => {
@@ -150,25 +131,42 @@ export const Task = ({ frontendId, task, isLoading, completeTask, skipTask }: Ta
     [replyContent]
   );
 
-  const submitResponse = () => {
+  const toast = useToast();
+
+  const submitResponse = useCallback(async () => {
     if (taskStatus.mode === "REVIEW") {
-      completeTask({
-        id: frontendId,
-        update_type: taskType.update_type,
-        content: replyContent.current,
-      });
       taskEvent({ action: "SET_SUBMITTED" });
-      scrollToTop(rootEl.current);
+      try {
+        await completeTask(replyContent.current);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } catch (err: any) {
+        if (!(err instanceof OasstError)) {
+          return console.log(err); // should not reach here
+        }
+        const errorCode = err.errorCode;
+        if (errorCode === ERROR_CODES.TASK_REQUESTED_TYPE_NOT_AVAILABLE) {
+          throw err; // will be handled in useGernericTaskAPI hook
+        }
+        const fallbackMessage = err.message || t("error:default");
+
+        toast({
+          status: "error",
+          description: t(getTypeSafei18nKey(`error:err_${errorCode}`), fallbackMessage, {
+            task_type: t(getTypeSafei18nKey(`tasks:${taskInfo.type}.label`)),
+          }),
+        });
+        taskEvent({ action: "RETURN_EDIT" });
+      }
     }
-  };
+  }, [taskStatus.mode, completeTask, toast, t, taskInfo.type]);
 
   const taskTypeComponent = useMemo(() => {
-    switch (taskType.category) {
+    switch (taskInfo.category) {
       case TaskCategory.Create:
         return (
           <CreateTask
             task={task as CreateTaskType}
-            taskType={taskType}
+            taskType={taskInfo}
             isEditable={taskStatus.mode === "EDIT"}
             isDisabled={taskStatus.mode === "SUBMITTED"}
             onReplyChanged={onReplyChanged}
@@ -179,7 +177,7 @@ export const Task = ({ frontendId, task, isLoading, completeTask, skipTask }: Ta
         return (
           <EvaluateTask
             task={task as RankTaskType}
-            taskType={taskType}
+            taskType={taskInfo}
             isEditable={taskStatus.mode === "EDIT"}
             isDisabled={taskStatus.mode === "SUBMITTED"}
             onReplyChanged={onReplyChanged}
@@ -190,7 +188,7 @@ export const Task = ({ frontendId, task, isLoading, completeTask, skipTask }: Ta
         return (
           <LabelTask
             task={task as LabelTaskType}
-            taskType={taskType}
+            taskType={taskInfo}
             isEditable={taskStatus.mode === "EDIT"}
             isDisabled={taskStatus.mode === "SUBMITTED"}
             onReplyChanged={onReplyChanged}
@@ -198,7 +196,7 @@ export const Task = ({ frontendId, task, isLoading, completeTask, skipTask }: Ta
           />
         );
     }
-  }, [task, taskType, taskStatus.mode, onReplyChanged, updateValidity]);
+  }, [taskInfo, task, taskStatus.mode, onReplyChanged, updateValidity]);
 
   return (
     <div ref={rootEl}>
@@ -207,6 +205,8 @@ export const Task = ({ frontendId, task, isLoading, completeTask, skipTask }: Ta
         task={task}
         taskStatus={taskStatus}
         isLoading={isLoading}
+        isRejecting={isRejecting}
+        isSubmitting={isSubmitting}
         onEdit={() => taskEvent({ action: "RETURN_EDIT" })}
         onReview={() => taskEvent({ action: "REVIEW" })}
         onSubmit={submitResponse}
@@ -214,9 +214,9 @@ export const Task = ({ frontendId, task, isLoading, completeTask, skipTask }: Ta
       />
       <UnchangedWarning
         show={taskStatus.mode === "DEFAULT_WARN"}
-        title={t(getTypeSafei18nKey(`${taskType.id}.unchanged_title`)) || t("default.unchanged_title")}
-        message={t(getTypeSafei18nKey(`${taskType.id}.unchanged_message`)) || t("default.unchanged_message")}
-        continueButtonText={"Continue anyway"}
+        title={t(getTypeSafei18nKey(`${taskInfo.id}.unchanged_title`), t("default.unchanged_title"))}
+        message={t(getTypeSafei18nKey(`${taskInfo.id}.unchanged_message`), t("default.unchanged_message"))}
+        continueButtonText={t(getTypeSafei18nKey(`${taskInfo.id}.continue_anyway`), t("default.continue_anyway"))}
         onClose={() => taskEvent({ action: "RETURN_EDIT" })}
         onContinueAnyway={() => {
           taskEvent({ action: "ACCEPT_DEFAULT" });
@@ -226,7 +226,7 @@ export const Task = ({ frontendId, task, isLoading, completeTask, skipTask }: Ta
   );
 };
 
-const scrollToTop = (element: HTMLElement) => {
+const scrollToTop = (element: HTMLElement | null) => {
   while (element) {
     element.scrollTop = 0;
     element = element.parentElement;

@@ -1,5 +1,6 @@
+import { Story } from "@storybook/react";
+import { SessionProvider } from "next-auth/react";
 import React from "react";
-import { Message } from "src/types/Conversation";
 
 import { MessageTableEntry } from "./MessageTableEntry";
 
@@ -9,8 +10,12 @@ export default {
   component: MessageTableEntry,
 };
 
-const Template = ({ enabled, highlight, ...message }) => {
-  return <MessageTableEntry message={message as Message} enabled={enabled} highlight={highlight} />;
+const Template: Story<any> = ({ enabled, highlight, ...message }) => {
+  return (
+    <SessionProvider>
+      <MessageTableEntry message={message} enabled={enabled} highlight={highlight} />;
+    </SessionProvider>
+  );
 };
 
 export const Default = Template.bind({});

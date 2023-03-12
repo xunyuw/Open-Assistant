@@ -96,6 +96,7 @@ def argument_parsing(parser):
         "wandb_entity": args.wandb_entity,
         "fp16": True,
         "tokenizer_name": training_conf["model_name"],
+        "output_dir": "output",
     }
 
     params = {**default_params, **training_conf}
@@ -111,11 +112,14 @@ def argument_parsing(parser):
     for name in ["learning_rate", "weight_decay", "max_grad_norm"]:
         params[name] = float(params[name])
 
+    if args.output_dir:
+        params["output_dir"] = args.output_dir
+
     return params
 
 
 def get_datasets(dataset_list: List[AnyStr], tokenizer):
-    from rank_datasets import AnthropicRLHF, GPTJSynthetic, HFSummary, WebGPT
+    from rank_datasets import AnthropicRLHF, GPTJSynthetic, HFSummary, OAPrivate, WebGPT
     from torch.utils.data import ConcatDataset
 
     train_datasets, evals = [], {}
@@ -141,5 +145,11 @@ def get_datasets(dataset_list: List[AnyStr], tokenizer):
             eval = AnthropicRLHF("test", tokenizer.sep_token)
             train_datasets.append(train)
             evals["anthropic_rlhf"] = eval
+        elif "oa_private" == dataset_name:
+            train = OAPrivate(split="train", sep_token=tokenizer.sep_token)
+            eval = OAPrivate(split="val", sep_token=tokenizer.sep_token)
+            train_datasets.append(train)
+            evals["oa_private"] = eval
+
     train = ConcatDataset(train_datasets)
     return train, evals

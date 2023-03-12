@@ -6,6 +6,7 @@ from oasst_backend.models import ApiClient, User
 from oasst_backend.utils.database_utils import CommitMode, managed_tx_method
 from oasst_shared.exceptions import OasstError, OasstErrorCode
 from oasst_shared.schemas import protocol as protocol_schema
+from oasst_shared.utils import utcnow
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, and_, or_
 from starlette.status import HTTP_403_FORBIDDEN, HTTP_404_NOT_FOUND
@@ -72,7 +73,8 @@ class UserRepository:
         enabled: Optional[bool] = None,
         notes: Optional[str] = None,
         show_on_leaderboard: Optional[bool] = None,
-    ) -> None:
+        tos_acceptance: Optional[bool] = None,
+    ) -> User:
         """
         Update a user by global user ID to disable or set admin notes. Only trusted clients may update users.
 
@@ -93,8 +95,11 @@ class UserRepository:
             user.notes = notes
         if show_on_leaderboard is not None:
             user.show_on_leaderboard = show_on_leaderboard
+        if tos_acceptance:
+            user.tos_acceptance_date = utcnow()
 
         self.db.add(user)
+        return user
 
     @managed_tx_method(CommitMode.COMMIT)
     def mark_user_deleted(self, id: UUID) -> None:
@@ -142,8 +147,10 @@ class UserRepository:
                     display_name=display_name,
                     api_client_id=self.api_client.id,
                     auth_method=auth_method,
-                    show_on_leaderboard=(auth_method != "system"),  # don't show system users, e.g. import user
                 )
+                if auth_method == "system":
+                    user.show_on_leaderboard = False  # don't show system users, e.g. import user
+                    user.tos_acceptance_date = utcnow()
                 self.db.add(user)
         elif display_name and display_name != user.display_name:
             # we found the user but the display name changed
@@ -155,6 +162,10 @@ class UserRepository:
     def lookup_client_user(self, client_user: protocol_schema.User, create_missing: bool = True) -> User | None:
         if not client_user:
             return None
+
+        if not (client_user.auth_method and client_user.id):
+            raise OasstError("Auth method or username missing.", OasstErrorCode.AUTH_AND_USERNAME_REQUIRED)
+
         num_retries = settings.DATABASE_MAX_TX_RETRY_COUNT
         for i in range(num_retries):
             try:
@@ -250,7 +261,6 @@ class UserRepository:
         limit: Optional[int] = 100,
         desc: bool = False,
     ) -> list[User]:
-
         if not self.api_client.trusted:
             if not api_client_id:
                 # Let unprivileged api clients query their own users without api_client_id being set
@@ -309,3 +319,8 @@ class UserRepository:
             qry = qry.limit(limit)
 
         return qry.all()
+
+    @managed_tx_method(CommitMode.FLUSH)
+    def update_user_last_activity(self, user: User) -> None:
+        user.last_activity_date = utcnow()
+        self.db.add(user)

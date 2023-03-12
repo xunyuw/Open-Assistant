@@ -26,7 +26,18 @@ class TaskRequestType(str, enum.Enum):
 class User(BaseModel):
     id: str
     display_name: str
-    auth_method: Literal["discord", "local"]
+    auth_method: Literal["discord", "local", "system"]
+
+
+class Account(BaseModel):
+    id: UUID
+    provider: str
+    provider_account_id: str
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
 
 
 class FrontEndUser(User):
@@ -35,6 +46,11 @@ class FrontEndUser(User):
     deleted: bool
     notes: str
     created_date: Optional[datetime] = None
+    show_on_leaderboard: bool
+    streak_days: Optional[int] = None
+    streak_last_day_date: Optional[datetime] = None
+    last_activity_date: Optional[datetime] = None
+    tos_acceptance_date: Optional[datetime] = None
 
 
 class PageResult(BaseModel):
@@ -52,13 +68,16 @@ class FrontEndUserPage(PageResult):
 class ConversationMessage(BaseModel):
     """Represents a message in a conversation between the user and the assistant."""
 
-    id: Optional[UUID] = None
-    frontend_message_id: Optional[str] = None
+    id: Optional[UUID]
+    user_id: Optional[UUID]
+    frontend_message_id: Optional[str]
     text: str
     lang: Optional[str]  # BCP 47
     is_assistant: bool
-    emojis: Optional[dict[str, int]] = None
-    user_emojis: Optional[list[str]] = None
+    emojis: Optional[dict[str, int]]
+    user_emojis: Optional[list[str]]
+    user_is_author: Optional[bool]
+    synthetic: Optional[bool]
 
 
 class Conversation(BaseModel):
@@ -80,8 +99,16 @@ class Conversation(BaseModel):
 
 
 class Message(ConversationMessage):
-    parent_id: Optional[UUID] = None
-    created_date: Optional[datetime] = None
+    parent_id: Optional[UUID]
+    created_date: Optional[datetime]
+    review_result: Optional[bool]
+    review_count: Optional[int]
+    deleted: Optional[bool]
+    model_name: Optional[str]
+    message_tree_id: Optional[UUID]
+    ranking_count: Optional[int]
+    rank: Optional[int]
+    user: Optional[FrontEndUser]
 
 
 class MessagePage(PageResult):
@@ -115,7 +142,7 @@ class TaskAck(BaseModel):
 class TaskNAck(BaseModel):
     """The frontend acknowledges that it has received a task but cannot create a message."""
 
-    reason: str
+    reason: str | None = Field(None, nullable=True)
 
 
 class TaskClose(BaseModel):
@@ -203,6 +230,7 @@ class RankConversationRepliesTask(Task):
     reply_messages: list[ConversationMessage]
     message_tree_id: UUID
     ranking_parent_id: UUID
+    reveal_synthetic: bool
 
 
 class RankPrompterRepliesTask(RankConversationRepliesTask):
@@ -245,22 +273,21 @@ class AbstractLabelTask(Task):
     mode: Optional[LabelTaskMode]
     disposition: Optional[LabelTaskDisposition]
     labels: Optional[list[LabelDescription]]
+    conversation: Conversation  # the conversation so far (labeling -> last message)
 
 
 class LabelInitialPromptTask(AbstractLabelTask):
     """A task to label an initial prompt."""
 
     type: Literal["label_initial_prompt"] = "label_initial_prompt"
-    prompt: str
+    prompt: str | None = Field(None, deprecated=True, description="deprecated, use `prompt_message`")
 
 
 class LabelConversationReplyTask(AbstractLabelTask):
     """A task to label a reply to a conversation."""
 
     type: Literal["label_conversation_reply"] = "label_conversation_reply"
-    conversation: Conversation  # the conversation so far (new: including the reply message)
-    reply_message: Optional[ConversationMessage]
-    reply: str
+    reply: str | None = Field(None, deprecated=True, description="deprecated, use last message of `conversation`")
 
 
 class LabelPrompterReplyTask(LabelConversationReplyTask):
@@ -329,8 +356,9 @@ class MessageRanking(Interaction):
     """A user has given a ranking for a message."""
 
     type: Literal["message_ranking"] = "message_ranking"
-    message_id: str
+    message_id: str  # parent message of replies that were ranked
     ranking: conlist(item_type=int, min_items=1)
+    not_rankable: Optional[bool]  # all options flawed, factually incorrect or unacceptable
 
 
 class LabelWidget(str, enum.Enum):
@@ -418,6 +446,7 @@ AnyInteraction = Union[
 class SystemStats(BaseModel):
     all: int = 0
     active: int = 0
+    active_by_lang: dict[str, int] = {}
     deleted: int = 0
     message_trees: int = 0
 
@@ -425,6 +454,7 @@ class SystemStats(BaseModel):
 class UserScore(BaseModel):
     rank: Optional[int]
     user_id: UUID
+    highlighted: bool = False
     username: str
     auth_method: str
     display_name: str
@@ -450,15 +480,59 @@ class UserScore(BaseModel):
     reply_ranked_2: int = 0
     reply_ranked_3: int = 0
 
-    # only used for time frame "total"
     streak_last_day_date: Optional[datetime]
     streak_days: Optional[int]
+    last_activity_date: Optional[datetime]
 
 
 class LeaderboardStats(BaseModel):
     time_frame: str
     last_updated: datetime
     leaderboard: List[UserScore]
+
+
+class TrollScore(BaseModel):
+    rank: Optional[int]
+    user_id: UUID
+    highlighted: bool = False
+    username: str
+    auth_method: str
+    display_name: str
+    last_activity_date: Optional[datetime]
+    enabled: bool
+    deleted: bool
+    show_on_leaderboard: bool
+
+    troll_score: int = 0
+
+    base_date: Optional[datetime]
+    modified_date: Optional[datetime]
+
+    red_flags: int = 0  # num reported messages of user
+    upvotes: int = 0  # num up-voted messages of user
+    downvotes: int = 0  # num down-voted messages of user
+
+    spam_prompts: int = 0
+
+    quality: Optional[float] = None
+    humor: Optional[float] = None
+    toxicity: Optional[float] = None
+    violence: Optional[float] = None
+    helpfulness: Optional[float] = None
+
+    spam: int = 0
+    lang_mismach: int = 0
+    not_appropriate: int = 0
+    pii: int = 0
+    hate_speech: int = 0
+    sexual_content: int = 0
+    political_content: int = 0
+
+
+class TrollboardStats(BaseModel):
+    time_frame: str
+    last_updated: datetime
+    trollboard: List[TrollScore]
 
 
 class OasstErrorResponse(BaseModel):
@@ -481,6 +555,11 @@ class EmojiCode(str, enum.Enum):
     poop = "poop"  # 💩
     skull = "skull"  # 💀
 
+    # skip task system uses special emoji codes
+    skip_reply = "_skip_reply"
+    skip_ranking = "_skip_ranking"
+    skip_labeling = "_skip_labeling"
+
 
 class EmojiOp(str, enum.Enum):
     togggle = "toggle"
@@ -492,3 +571,28 @@ class MessageEmojiRequest(BaseModel):
     user: User
     op: EmojiOp = EmojiOp.togggle
     emoji: EmojiCode
+
+
+class CreateFrontendUserRequest(User):
+    show_on_leaderboard: bool = True
+    enabled: bool = True
+    tos_acceptance: Optional[bool] = None
+    notes: Optional[str] = None
+
+
+class CachedStatsName(str, enum.Enum):
+    human_messages_by_lang = "human_messages_by_lang"
+    human_messages_by_role = "human_messages_by_role"
+    message_trees_by_state = "message_trees_by_state"
+    message_trees_states_by_lang = "message_trees_states_by_lang"
+    users_accepted_tos = "users_accepted_tos"
+
+
+class CachedStatsResponse(BaseModel):
+    name: CachedStatsName | str
+    last_updated: datetime
+    stats: dict | list
+
+
+class AllCachedStatsResponse(BaseModel):
+    stats_by_name: dict[CachedStatsName | str, CachedStatsResponse]

@@ -3,7 +3,7 @@ from uuid import UUID
 
 from oasst_backend.models.payload_column_type import payload_type
 from oasst_shared.schemas import protocol as protocol_schema
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 @payload_type
@@ -67,6 +67,7 @@ class RankingReactionPayload(ReactionPayload):
     ranked_message_ids: list[UUID]
     ranking_parent_id: Optional[UUID]
     message_tree_id: Optional[UUID]
+    not_rankable: Optional[bool]  # all options flawed, factually incorrect or unacceptable
 
 
 @payload_type
@@ -75,6 +76,7 @@ class RankConversationRepliesPayload(TaskPayload):
     reply_messages: list[protocol_schema.ConversationMessage]
     ranking_parent_id: Optional[UUID]
     message_tree_id: Optional[UUID]
+    reveal_synthetic: Optional[bool]
 
 
 @payload_type
@@ -117,8 +119,10 @@ class LabelConversationReplyPayload(TaskPayload):
 
     message_id: UUID
     conversation: protocol_schema.Conversation
-    reply: str  # deprecated
-    reply_message: Optional[protocol_schema.ConversationMessage]
+    reply: Optional[str] = Field(None, deprecated=True, description="deprecated")
+    reply_message: Optional[protocol_schema.ConversationMessage] = Field(
+        None, deprecated=True, description="deprecated"
+    )
     valid_labels: list[str]
     mandatory_labels: Optional[list[str]]
     mode: Optional[protocol_schema.LabelTaskMode]

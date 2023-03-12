@@ -66,7 +66,7 @@ def get_winner(pairs):
 
 def get_ranking(pairs):
     """
-    Abuses concordance property to get a (not necessarily unqiue) ranking.
+    Abuses concordance property to get a (not necessarily unique) ranking.
     The lack of uniqueness is due to the potential existence of multiple
     equally ranked winners. We have to pick one, which is where
     the non-uniqueness comes from
@@ -108,7 +108,7 @@ def ranked_pairs(ranks: List[List[int]]):
     sorted_majorities = np.array(sorted(sorted_majorities, key=lambda x: x[2], reverse=True))
     # now do lock ins
     lock_ins = []
-    for (x, y, _) in sorted_majorities:
+    for x, y, _ in sorted_majorities:
         # invariant: lock_ins has no cycles here
         lock_ins.append((x, y))
         # print("lock ins are now",np.array(lock_ins))

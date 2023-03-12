@@ -2,20 +2,22 @@
 
 Trainer code based on huggingface. Compatible with deepspeed or accelerate
 
-Requirements
+## Requirements
 
-```
-wandb
-evaluate
-datasets
-transformers
-torch==1.12
-```
+`pip install .`
 
-Start training reward model
+Run tests: `pytest .`
+
+Write or inherit a `configs/<config-name>.yml` file to store training
+configuration details.
+
+> The configuration file must have _at least_ all the keys present in
+> [`configs/dummy.yml`](configs/dummy.yml)
+
+Run training procedure
 
 ```bash
-python trainer.py configs/electra-base-dis-webgpt.yml
+python trainer.py configs/<config-name>.yml
 ```
 
 Additional axis labeling, this outputs a 4 summary quality evaluation metrics
